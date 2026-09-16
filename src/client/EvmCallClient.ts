@@ -35,6 +35,7 @@ import type {
 import {
   type LogFilter,
   type EvmLog,
+  type LogChunk,
   type GetLogsChunkedOptions,
   parseLogFilter,
   normalizeEvmLog,
@@ -978,13 +979,13 @@ export class EvmCallClient {
   }
 
   /**
-   * Async generator that streams event logs chunk by chunk in block order.
-   * Ideal for indexing pipelines to avoid loading all logs in memory at once.
+   * Async generator that streams event logs chunk by chunk with explicit block range boundaries.
+   * Ideal for indexing pipelines to atomically commit contiguous ranges.
    */
-  async *iterateLogs(
+  async *iterateLogChunks(
     filter: LogFilter,
     options?: GetLogsChunkedOptions,
-  ): AsyncGenerator<readonly EvmLog[], void, unknown> {
+  ): AsyncGenerator<LogChunk, void, unknown> {
     const batchOptions: JsonRpcBatchExecutionOptions = {
       ...(options?.signal !== undefined ? { signal: options.signal } : {}),
       ...(options?.cacheTtlMs !== undefined ? { cacheTtlMs: options.cacheTtlMs } : {}),
@@ -992,7 +993,11 @@ export class EvmCallClient {
 
     if (filter.blockHash !== undefined) {
       const logs = await this.getLogs(filter, batchOptions);
-      yield logs;
+      yield {
+        fromBlock: logs.length > 0 ? logs[0]!.blockNumber : 0n,
+        toBlock: logs.length > 0 ? logs[logs.length - 1]!.blockNumber : 0n,
+        logs,
+      };
       return;
     }
 
@@ -1086,8 +1091,25 @@ export class EvmCallClient {
           chunkLogsCount: chunkLogs.length,
           totalLogsSoFar,
         });
-        yield chunkLogs;
+        yield {
+          fromBlock: interval.start,
+          toBlock: interval.end,
+          logs: chunkLogs,
+        };
       }
+    }
+  }
+
+  /**
+   * Async generator that streams event logs chunk by chunk in block order.
+   * Ideal for indexing pipelines to avoid loading all logs in memory at once.
+   */
+  async *iterateLogs(
+    filter: LogFilter,
+    options?: GetLogsChunkedOptions,
+  ): AsyncGenerator<readonly EvmLog[], void, unknown> {
+    for await (const chunk of this.iterateLogChunks(filter, options)) {
+      yield chunk.logs;
     }
   }
 

@@ -20,8 +20,8 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "build": "tsup && tsc --project tsconfig.build.json",
-    "prepare": "tsup && tsc --project tsconfig.build.json",
+    "build": "tsup",
+    "prepare": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

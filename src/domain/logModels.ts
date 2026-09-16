@@ -53,6 +53,12 @@ export interface EvmLog {
   readonly removed?: boolean | undefined;
 }
 
+export interface LogChunk {
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly logs: readonly EvmLog[];
+}
+
 export interface GetLogsChunkedOptions {
   /**
    * Maximum number of blocks to query per chunk.
