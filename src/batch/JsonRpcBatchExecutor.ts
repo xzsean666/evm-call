@@ -280,9 +280,11 @@ export class JsonRpcBatchExecutor {
         this.pool.reportOutcome(endpoint.id, "success");
         return result;
       } catch (error: unknown) {
-        this.pool.reportOutcome(endpoint.id, "failure");
+        if (!isAborted(signal) && !isAbortError(error)) {
+          this.pool.reportOutcome(endpoint.id, "failure");
+        }
         lastError = error;
-        if (isAborted(signal) || !isRetryableFailure(error)) {
+        if (isAborted(signal) || isAbortError(error) || !isRetryableFailure(error)) {
           throw error;
         }
       }
@@ -295,15 +297,26 @@ export class JsonRpcBatchExecutor {
     signal?: AbortSignal,
     filter?: HealthySnapshotFilter,
   ): Promise<readonly RpcEndpointLike[]> {
-    const snapshot = this.pool.healthySnapshot(this.randomSource, filter);
+    let snapshot = this.pool.healthySnapshot(this.randomSource, filter);
     if (snapshot.length > 0) {
       return snapshot;
     }
     if (this.pool.refreshIfNeeded !== undefined) {
       await this.pool.refreshIfNeeded(signal, filter);
     }
-    return this.pool.healthySnapshot(this.randomSource, filter);
+    snapshot = this.pool.healthySnapshot(this.randomSource, filter);
+    if (snapshot.length > 0) {
+      return snapshot;
+    }
+    return this.pool.healthySnapshot(this.randomSource, {
+      ...filter,
+      fallbackToEarliestExpiring: true,
+    });
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"));
 }
 
 function isRetryableFailure(error: unknown): boolean {

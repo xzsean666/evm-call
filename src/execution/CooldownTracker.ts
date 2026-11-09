@@ -19,6 +19,10 @@ export const MAX_COOLDOWN_MS = 86_400_000;
 export interface CooldownTrackerOptions {
   readonly clock?: Clock;
   readonly cooldownTiersMs?: readonly number[];
+  /** When true, applies decorrelated jitter to cooldown intervals to avoid thundering herd. */
+  readonly enableJitter?: boolean;
+  /** Jitter ratio between 0.0 and 1.0 (defaults to 0.2, representing ±20% variation). */
+  readonly jitterRatio?: number;
 }
 
 export interface CooldownState {
@@ -34,6 +38,8 @@ export interface CooldownState {
 export class CooldownTracker {
   private readonly clock: Clock;
   private readonly tiers: readonly number[];
+  private readonly enableJitter: boolean;
+  private readonly jitterRatio: number;
   private consecutiveFailures = 0;
   private currentCooldownMs = 0;
   private cooldownUntil: number | null = null;
@@ -42,12 +48,23 @@ export class CooldownTracker {
   constructor(options: CooldownTrackerOptions = {}) {
     this.clock = options.clock ?? systemClock;
     this.tiers = options.cooldownTiersMs ?? COOLDOWN_TIERS_MS;
+    this.enableJitter = options.enableJitter ?? false;
+    this.jitterRatio = Math.max(0, Math.min(1, options.jitterRatio ?? 0.2));
   }
 
-  recordFailure(now = this.clock.now()): number {
+  recordFailure(now = this.clock.now(), options?: { readonly jitter?: boolean }): number {
     this.consecutiveFailures += 1;
     const tierIndex = Math.min(this.consecutiveFailures - 1, this.tiers.length - 1);
-    this.currentCooldownMs = this.tiers[tierIndex]!;
+    let baseCooldownMs = this.tiers[tierIndex]!;
+
+    const useJitter = options?.jitter ?? this.enableJitter;
+    if (useJitter && this.jitterRatio > 0) {
+      // Jitter in range [1 - jitterRatio, 1 + jitterRatio]
+      const factor = 1 - this.jitterRatio + Math.random() * (2 * this.jitterRatio);
+      baseCooldownMs = Math.max(1_000, Math.round(baseCooldownMs * factor));
+    }
+
+    this.currentCooldownMs = baseCooldownMs;
     if (this.firstFailureAt === null) {
       this.firstFailureAt = now;
     }
@@ -60,6 +77,13 @@ export class CooldownTracker {
     this.currentCooldownMs = 0;
     this.cooldownUntil = null;
     this.firstFailureAt = null;
+  }
+
+  /**
+   * Resets cooldown state while keeping failure history if any (or clean reset).
+   */
+  resetCooldown(): void {
+    this.recordSuccess();
   }
 
   restoreState(state: {

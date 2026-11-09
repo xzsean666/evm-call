@@ -24,8 +24,13 @@ export const MULTICALL3_DEPLOYMENT_BLOCKS: Readonly<Record<number, bigint>> = Ob
   8453: MULTICALL3_BASE_MAINNET_DEPLOYMENT_BLOCK,
   10: 4_218_602n,     // Optimism
   42161: 765_470n,    // Arbitrum One
+  421614: 106_536n,   // Arbitrum Sepolia
   137: 25_770_160n,   // Polygon
+  80002: 3_127_388n,  // Polygon Amoy
   56: 15_921_452n,    // BSC
+  97: 17_420_955n,    // BSC Testnet
+  1868: 0n,           // Soneium
+  1946: 0n,           // Soneium Minato
   43114: 11_907_934n, // Avalanche
   59144: 42n,         // Linea
   534352: 222_771n,   // Scroll
