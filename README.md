@@ -246,12 +246,42 @@ client.close();
 
 ---
 
+### 8. RPC 节点能力标签与智能路由 (Archive vs Full RPC)
+
+当同时配置了昂贵稀缺的 **Archive（归档）节点** 与大量免费廉价的 **Full（普通全节点/剪裁节点）** 时，可为端点指定 `tag`：
+
+```typescript
+const client = createEvmCallClient({
+  chainId: "ethereum",
+  endpoints: [
+    // 明确标记为 archive 归档节点（若省略 tag，默认即为 "archive"，100% 向后兼容）
+    { id: "alchemy-archive", url: "https://eth-mainnet.g.alchemy.com/v2/KEY", tag: "archive" },
+    // 标记为普通 full 节点（仅保留最新 ~128 块状态）
+    { id: "public-full", url: "https://eth.drpc.org", tag: "full" },
+  ],
+});
+
+// 1. 常规最新查询：系统智能识别为非归档调用，优先调度 full 节点，保护归档节点额度！
+const gasPrice = await client.getGasPrice();
+const latestBal = await client.call({ method: "eth_getBalance", params: ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "latest"] });
+
+// 2. 历史归档查询：系统自动识别请求中包含历史区块/时间戳，自动且仅调度 archive 节点！
+const histBlock = await client.getBlock(18_000_000);
+const blockNumber = await client.findBlockNumberByTimestamp(1700000000n);
+```
+
+- **启动探针自动解耦**: Archive 节点探测历史块高；Full 节点自动探测 `"latest"`，普通全节点不再因缺少远古历史块而被启动健康检查误杀。
+- **故障优雅避退与回退**: 若所有 Full 节点临时遭遇网络波动或限流进入 CD 惩罚期，最新状态查询将自动平滑回退至 Archive 节点，保证业务不中断。
+
+---
+
 ## 客户端配置参数 (Options)
 
 | 参数 | 类型 | 默认值 | 描述 |
 | :--- | :--- | :--- | :--- |
 | `chainId` | `number \| string` | `1` | 目标链 ID 或链名（`"ethereum"`, `"base"`） |
-| `customRpcUrls` | `string[]` | `[]` | 用户自定义私有 RPC 端点列表 |
+| `endpoints` | `(RpcEndpoint \| string)[]` | `[]` | 带标签（`tag: "archive" \| "full"`）的 RPC 端点配置列表 |
+| `customRpcUrls` | `string[]` | `[]` | 快捷注入自定义 RPC URL（默认赋予 `archive` 标签） |
 | `storagePath` | `string` | `"./data/evm-call.db"` | SQLite 本地落盘路径（测试可传 `":memory:"`） |
 | `defaultBatchChunkSize`| `number` | `100` | JSON-RPC 批量单包最大切片大小 |
 | `defaultMaxConcurrency`| `number` | `3` | 跨切片有界最大并发数 |

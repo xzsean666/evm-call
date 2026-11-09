@@ -7,14 +7,18 @@ import type { SqliteCooldownStore } from "../storage/SqliteCooldownStore";
 import { BUILTIN_ETHEREUM_RPCS } from "./builtinEthereumRpcs";
 import { BUILTIN_BASE_RPCS } from "./builtinBaseRpcs";
 
+export type RpcEndpointTag = "archive" | "full";
+
 export interface RpcEndpoint {
   readonly id: string;
   readonly url: string;
   readonly envKeyName?: string;
+  readonly tag?: RpcEndpointTag | string;
 }
 
 export interface EndpointCooldownState {
   readonly id: string;
+  readonly tag: string;
   readonly envKeyName?: string | undefined;
   readonly isMaxCooldown: boolean;
   readonly isCoolingDown: boolean;
@@ -33,6 +37,20 @@ export interface CooldownChangeEvent {
   readonly state: CooldownState;
 }
 
+export interface HealthySnapshotFilter {
+  /** If true, only endpoints with tag "archive" (or default archive) are returned. */
+  readonly requireArchive?: boolean;
+  /**
+   * If true (and requireArchive is not true), prefer healthy "full" endpoints first.
+   * If any healthy "full" endpoints exist, return them.
+   * If no healthy "full" endpoints exist, fallback to "archive" endpoints.
+   * Defaults to true when requireArchive is false.
+   */
+  readonly preferFull?: boolean;
+  /** Explicitly match a specific tag (e.g. "archive" or "full"). */
+  readonly tag?: RpcEndpointTag | string;
+}
+
 export interface RpcPoolOptions {
   readonly chainId?: number | undefined;
   readonly endpoints?: readonly (RpcEndpoint | string)[] | undefined;
@@ -46,6 +64,13 @@ export interface RpcPoolOptions {
   readonly healthRefreshCooldownMs?: number | undefined;
   readonly clock?: Clock | undefined;
   readonly onCooldownChange?: ((event: CooldownChangeEvent) => void) | undefined;
+  /**
+   * For non-archive calls, whether to prioritize healthy "full" nodes to save archive quota.
+   * If true: prefers "full" nodes, falling back to "archive" if no "full" nodes are available.
+   * If false: pools all healthy "full" and "archive" nodes together in equal load balancing.
+   * Defaults to true.
+   */
+  readonly preferFull?: boolean | undefined;
 }
 
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS = 10_000;
@@ -62,6 +87,7 @@ export class RpcPool {
   private readonly maxConcurrentProbes: number;
   private readonly healthRefreshCooldownMs: number;
   private readonly clock: Clock;
+  private readonly defaultPreferFull: boolean;
   private readonly healthy = new Map<string, boolean>();
   private readonly trackers = new Map<string, CooldownTracker>();
   private readonly onCooldownChange?: ((event: CooldownChangeEvent) => void) | undefined;
@@ -72,6 +98,7 @@ export class RpcPool {
     this.chainId = options.chainId ?? 1;
     this.transport = options.transport ?? new ArchiveRpcTransport();
     this.cooldownStore = options.cooldownStore;
+    this.defaultPreferFull = options.preferFull ?? true;
     if (options.probeBlockNumber === "latest" || options.probeBlockNumber === null) {
       this.probeBlockNumber = undefined;
     } else if (options.probeBlockNumber !== undefined) {
@@ -129,10 +156,10 @@ export class RpcPool {
   /**
    * Re-probes endpoints when all are unhealthy or cooling down, debounced by cooldown.
    */
-  async refreshIfNeeded(signal?: AbortSignal): Promise<void> {
+  async refreshIfNeeded(signal?: AbortSignal, filter?: HealthySnapshotFilter): Promise<void> {
     const now = this.clock.now();
-    const anyAvailable = this.endpoints.some((ep) => this.isHealthy(ep.id, now));
-    if (anyAvailable) {
+    const available = this.filterHealthyEndpoints(filter, now);
+    if (available.length > 0) {
       return;
     }
 
@@ -164,10 +191,72 @@ export class RpcPool {
   }
 
   /**
-   * Returns healthy endpoints in an unbiased random permutation.
+   * Filters healthy endpoints matching given tag or archive requirements.
    */
-  healthySnapshot(randomSource: RandomSource = systemRandom, now = this.clock.now()): readonly RpcEndpoint[] {
-    const candidates = this.endpoints.filter((ep) => this.isHealthy(ep.id, now));
+  private filterHealthyEndpoints(
+    filter?: HealthySnapshotFilter,
+    now = this.clock.now(),
+  ): readonly RpcEndpoint[] {
+    const healthyEndpoints = this.endpoints.filter((ep) => this.isHealthy(ep.id, now));
+
+    if (filter?.tag !== undefined) {
+      return healthyEndpoints.filter((ep) => (ep.tag ?? "archive") === filter.tag);
+    }
+
+    if (filter?.requireArchive) {
+      return healthyEndpoints.filter((ep) => (ep.tag ?? "archive") === "archive");
+    }
+
+    // Non-archive requests: prefer healthy "full" nodes to save archive quota,
+    // falling back to "archive" nodes if no healthy "full" nodes exist.
+    const preferFull = filter?.preferFull ?? this.defaultPreferFull;
+    if (preferFull) {
+      const fullCandidates = healthyEndpoints.filter((ep) => (ep.tag ?? "archive") === "full");
+      if (fullCandidates.length > 0) {
+        return fullCandidates;
+      }
+      return healthyEndpoints.filter((ep) => (ep.tag ?? "archive") === "archive");
+    }
+
+    return healthyEndpoints;
+  }
+
+  /**
+   * Returns healthy endpoints in an unbiased random permutation,
+   * intelligently filtered by archive requirement or endpoint tag.
+   */
+  healthySnapshot(
+    arg1?: RandomSource | (HealthySnapshotFilter & { readonly randomSource?: RandomSource; readonly now?: number }),
+    arg2?: HealthySnapshotFilter | number,
+    arg3?: number,
+  ): readonly RpcEndpoint[] {
+    let randomSource: RandomSource = systemRandom;
+    let filter: HealthySnapshotFilter | undefined;
+    let now = this.clock.now();
+
+    if (arg1 !== undefined) {
+      if (isRandomSource(arg1)) {
+        randomSource = arg1;
+        if (typeof arg2 === "number") {
+          now = arg2;
+        } else if (arg2 !== undefined && typeof arg2 === "object") {
+          filter = arg2;
+          if (typeof arg3 === "number") {
+            now = arg3;
+          }
+        }
+      } else if (typeof arg1 === "object" && arg1 !== null) {
+        filter = arg1;
+        if (arg1.randomSource !== undefined) {
+          randomSource = arg1.randomSource;
+        }
+        if (typeof arg1.now === "number") {
+          now = arg1.now;
+        }
+      }
+    }
+
+    const candidates = this.filterHealthyEndpoints(filter, now);
     return Object.freeze(shuffle(candidates, randomSource));
   }
 
@@ -225,6 +314,7 @@ export class RpcPool {
     const state = tracker.getState(now);
     return Object.freeze({
       id: endpoint.id,
+      tag: endpoint.tag ?? "archive",
       ...(endpoint.envKeyName !== undefined ? { envKeyName: endpoint.envKeyName } : {}),
       isMaxCooldown: state.isMaxCooldown,
       isCoolingDown: state.isCoolingDown,
@@ -265,13 +355,16 @@ export class RpcPool {
       }
 
       // 2. eth_getBlockByNumber check
+      // Archive nodes probe probeBlockNumber; full nodes probe "latest".
+      const isArchive = (endpoint.tag ?? "archive") === "archive";
+      const targetBlockNumber = isArchive ? this.probeBlockNumber : undefined;
       const blockTag =
-        this.probeBlockNumber !== undefined
-          ? `0x${this.probeBlockNumber.toString(16)}`
+        targetBlockNumber !== undefined
+          ? `0x${targetBlockNumber.toString(16)}`
           : "latest";
 
       const block = await this.callProbe(endpoint, "eth_getBlockByNumber", [blockTag, false], signal);
-      if (!isValidBlockHeader(block, this.probeBlockNumber)) {
+      if (!isValidBlockHeader(block, targetBlockNumber)) {
         return false;
       }
 
@@ -313,19 +406,25 @@ function resolveEndpoints(
       } catch {
         // fallback
       }
-      return { id: `custom-${index + 1}-${host}`, url: entry };
+      return { id: `custom-${index + 1}-${host}`, url: entry, tag: "archive" };
     }
-    return entry;
+    return {
+      ...entry,
+      tag: entry.tag ?? "archive",
+    };
   });
 
   result.push(...normalizedCustom);
 
   if (result.length === 0 || appendBuiltins) {
-    if (chainId === 1) {
-      result.push(...BUILTIN_ETHEREUM_RPCS);
-    } else if (chainId === 8453) {
-      result.push(...BUILTIN_BASE_RPCS);
-    }
+    const builtins =
+      chainId === 1 ? BUILTIN_ETHEREUM_RPCS : chainId === 8453 ? BUILTIN_BASE_RPCS : [];
+    result.push(
+      ...builtins.map((ep) => ({
+        ...ep,
+        tag: ep.tag ?? "archive",
+      })),
+    );
   }
 
   return result;
@@ -371,4 +470,8 @@ async function runBounded<T>(
   }
   const runners = Array.from({ length: Math.min(concurrency, items.length) }, () => next());
   await Promise.all(runners);
+}
+
+function isRandomSource(val: unknown): val is RandomSource {
+  return typeof val === "object" && val !== null && typeof (val as { next?: unknown }).next === "function";
 }

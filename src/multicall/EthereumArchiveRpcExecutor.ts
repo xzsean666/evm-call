@@ -5,6 +5,7 @@ import {
   rpcBlockReorgDetected,
   rpcResponseInvalid,
 } from "../domain/errors";
+import { isHistoricalBlockTag } from "../domain/jsonRpcModels";
 import type { RandomSource } from "../execution/clock";
 import { systemRandom } from "../execution/clock";
 import {
@@ -13,6 +14,7 @@ import {
   type ArchiveRpcCallOptions,
 } from "../transport/ArchiveRpcTransport";
 import type { RpcEndpointLike, RpcPoolLike } from "../batch/JsonRpcBatchExecutor";
+import type { HealthySnapshotFilter } from "../pool/RpcPool";
 
 export interface EthereumArchiveRpcExecutorOptions {
   readonly pool: RpcPoolLike;
@@ -69,9 +71,13 @@ export class EthereumArchiveRpcExecutor {
     targetTimestampSeconds: bigint,
     lowerBoundBlock: bigint = 0n,
     signal?: AbortSignal,
+    options?: { readonly requireArchive?: boolean; readonly tag?: string },
   ): Promise<{ readonly blockNumber: string; readonly rpcEndpointId: string }> {
     const deadline = this.now() + this.totalTimeoutMs;
-    const snapshot = await this.healthySnapshotWithRefresh(signal);
+    const snapshot = await this.healthySnapshotWithRefresh(signal, {
+      requireArchive: options?.requireArchive ?? true,
+      ...(options?.tag !== undefined ? { tag: options.tag } : {}),
+    });
     if (snapshot.length === 0) {
       throw archiveRpcUnavailable("No healthy RPC endpoint is available in the pool.");
     }
@@ -93,9 +99,13 @@ export class EthereumArchiveRpcExecutor {
    */
   async findLatestBlockNumber(
     signal?: AbortSignal,
+    options?: { readonly requireArchive?: boolean; readonly tag?: string },
   ): Promise<{ readonly blockNumber: string; readonly rpcEndpointId: string }> {
     const deadline = this.now() + this.totalTimeoutMs;
-    const snapshot = await this.healthySnapshotWithRefresh(signal);
+    const snapshot = await this.healthySnapshotWithRefresh(signal, {
+      requireArchive: options?.requireArchive ?? false,
+      ...(options?.tag !== undefined ? { tag: options.tag } : {}),
+    });
     if (snapshot.length === 0) {
       throw archiveRpcUnavailable("No healthy RPC endpoint is available in the pool.");
     }
@@ -114,6 +124,8 @@ export class EthereumArchiveRpcExecutor {
     readonly multicall3Address: string;
     readonly batches: readonly string[];
     readonly signal?: AbortSignal;
+    readonly requireArchive?: boolean;
+    readonly tag?: string;
   }): Promise<{
     readonly blockHash: string;
     readonly blockTimestamp: string;
@@ -121,7 +133,12 @@ export class EthereumArchiveRpcExecutor {
     readonly batchReturnData: readonly string[];
   }> {
     const deadline = this.now() + this.totalTimeoutMs;
-    const snapshot = await this.healthySnapshotWithRefresh(request.signal);
+    const requireArchive =
+      request.requireArchive ?? isHistoricalBlockTag(request.blockNumber);
+    const snapshot = await this.healthySnapshotWithRefresh(request.signal, {
+      requireArchive,
+      ...(request.tag !== undefined ? { tag: request.tag } : {}),
+    });
     if (snapshot.length === 0) {
       throw archiveRpcUnavailable("No healthy RPC endpoint is available in the pool.");
     }
@@ -138,6 +155,8 @@ export class EthereumArchiveRpcExecutor {
     readonly address: string;
     readonly blockNumber: string;
     readonly signal?: AbortSignal;
+    readonly requireArchive?: boolean;
+    readonly tag?: string;
   }): Promise<{
     readonly amount: string;
     readonly blockHash: string;
@@ -145,7 +164,12 @@ export class EthereumArchiveRpcExecutor {
     readonly rpcEndpointId: string;
   }> {
     const deadline = this.now() + this.totalTimeoutMs;
-    const snapshot = await this.healthySnapshotWithRefresh(request.signal);
+    const requireArchive =
+      request.requireArchive ?? isHistoricalBlockTag(request.blockNumber);
+    const snapshot = await this.healthySnapshotWithRefresh(request.signal, {
+      requireArchive,
+      ...(request.tag !== undefined ? { tag: request.tag } : {}),
+    });
     if (snapshot.length === 0) {
       throw archiveRpcUnavailable("No healthy RPC endpoint is available in the pool.");
     }
@@ -231,13 +255,16 @@ export class EthereumArchiveRpcExecutor {
     return { number: BigInt(block.number), timestamp: BigInt(block.timestamp) };
   }
 
-  private async healthySnapshotWithRefresh(signal?: AbortSignal): Promise<readonly RpcEndpointLike[]> {
-    const snapshot = this.pool.healthySnapshot(this.randomSource);
+  private async healthySnapshotWithRefresh(
+    signal?: AbortSignal,
+    filter?: HealthySnapshotFilter,
+  ): Promise<readonly RpcEndpointLike[]> {
+    const snapshot = this.pool.healthySnapshot(this.randomSource, filter);
     if (snapshot.length > 0) return snapshot;
     if (this.pool.refreshIfNeeded !== undefined) {
-      await this.pool.refreshIfNeeded(signal);
+      await this.pool.refreshIfNeeded(signal, filter);
     }
-    return this.pool.healthySnapshot(this.randomSource);
+    return this.pool.healthySnapshot(this.randomSource, filter);
   }
 
   private async runEndpointAttempts<T>(

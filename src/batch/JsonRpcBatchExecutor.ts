@@ -7,6 +7,7 @@ import type { RandomSource } from "../execution/clock";
 import { systemRandom } from "../execution/clock";
 import {
   parseJsonRpcRequests,
+  requiresArchiveRequest,
   type JsonRpcBatchExecutionOptions,
   type JsonRpcBatchItemResult,
   type JsonRpcRequest,
@@ -18,17 +19,22 @@ import {
   type JsonRpcBatchResponseItem,
 } from "../transport/ArchiveRpcTransport";
 import type { RpcCacheService, RpcCacheBatchEntry } from "../storage/RpcCacheService";
+import type { HealthySnapshotFilter } from "../pool/RpcPool";
 
 export interface RpcEndpointLike {
   readonly id: string;
   readonly url: string;
+  readonly tag?: string;
 }
 
 export interface RpcPoolLike {
   readonly chainId?: number;
-  healthySnapshot(randomSource: RandomSource): readonly RpcEndpointLike[];
+  healthySnapshot(
+    randomSource?: RandomSource,
+    filter?: HealthySnapshotFilter,
+  ): readonly RpcEndpointLike[];
   reportOutcome(id: string, outcome: "success" | "failure"): void;
-  refreshIfNeeded?(signal?: AbortSignal): Promise<void>;
+  refreshIfNeeded?(signal?: AbortSignal, filter?: HealthySnapshotFilter): Promise<void>;
 }
 
 export interface JsonRpcBatchExecutorOptions {
@@ -134,12 +140,26 @@ export class JsonRpcBatchExecutor {
     const deadline = this.now() + this.totalTimeoutMs;
     const chunks = chunk(missing, normalized.batchChunkSize);
 
+    // Intelligently determine if archive endpoint is required based on call methods/params
+    const needsArchive =
+      options?.requireArchive ?? normalized.requests.some(requiresArchiveRequest);
+    const filter: HealthySnapshotFilter = {
+      requireArchive: needsArchive,
+      ...(needsArchive
+        ? { preferFull: false }
+        : options?.preferFull !== undefined
+          ? { preferFull: options.preferFull }
+          : {}),
+      ...(options?.tag !== undefined ? { tag: options.tag } : {}),
+    };
+
     await runBounded(chunks, normalized.maxConcurrency, async (chunkSlice) => {
       const rawRequests = chunkSlice.map((m) => m.request);
       const chunkResponse = await this.executeChunkWithFailover(
         rawRequests,
         normalized.signal,
         deadline,
+        filter,
       );
 
       const cacheEntries: RpcCacheBatchEntry[] = [];
@@ -221,8 +241,9 @@ export class JsonRpcBatchExecutor {
     requests: readonly NormalizedJsonRpcRequest[],
     signal: AbortSignal | undefined,
     deadline: number,
+    filter?: HealthySnapshotFilter,
   ): Promise<readonly JsonRpcBatchResponseItem[]> {
-    const snapshot = await this.healthySnapshotWithRefresh(signal);
+    const snapshot = await this.healthySnapshotWithRefresh(signal, filter);
     if (snapshot.length === 0) {
       throw archiveRpcUnavailable("No healthy RPC endpoint is available in the pool.");
     }
@@ -270,15 +291,18 @@ export class JsonRpcBatchExecutor {
     throw lastError;
   }
 
-  private async healthySnapshotWithRefresh(signal?: AbortSignal): Promise<readonly RpcEndpointLike[]> {
-    const snapshot = this.pool.healthySnapshot(this.randomSource);
+  private async healthySnapshotWithRefresh(
+    signal?: AbortSignal,
+    filter?: HealthySnapshotFilter,
+  ): Promise<readonly RpcEndpointLike[]> {
+    const snapshot = this.pool.healthySnapshot(this.randomSource, filter);
     if (snapshot.length > 0) {
       return snapshot;
     }
     if (this.pool.refreshIfNeeded !== undefined) {
-      await this.pool.refreshIfNeeded(signal);
+      await this.pool.refreshIfNeeded(signal, filter);
     }
-    return this.pool.healthySnapshot(this.randomSource);
+    return this.pool.healthySnapshot(this.randomSource, filter);
   }
 }
 

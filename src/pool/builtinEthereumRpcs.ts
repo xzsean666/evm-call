@@ -1,6 +1,7 @@
 export interface BuiltinRpcEndpoint {
   readonly id: string;
   readonly url: string;
+  readonly tag?: "archive" | "full";
 }
 
 export const BUILTIN_ETHEREUM_RPCS: readonly BuiltinRpcEndpoint[] = Object.freeze([

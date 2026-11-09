@@ -75,6 +75,12 @@ export interface JsonRpcBatchExecutionOptions {
   /** Request-specific cache TTL in milliseconds. Pass 0 to force bypass cache. */
   readonly cacheTtlMs?: number;
   readonly signal?: AbortSignal;
+  /** Explicitly enforce whether this execution requires an archive RPC endpoint. */
+  readonly requireArchive?: boolean;
+  /** For non-archive calls, whether to prioritize full endpoints (defaults to pool setting). */
+  readonly preferFull?: boolean;
+  /** Explicitly target endpoints with this specific tag (e.g. "archive" or "full"). */
+  readonly tag?: string;
 }
 
 export interface NormalizedJsonRpcRequest {
@@ -89,6 +95,9 @@ export interface NormalizedJsonRpcBatchRequest {
   readonly maxConcurrency: number;
   readonly cacheTtlMs?: number;
   readonly signal?: AbortSignal;
+  readonly requireArchive?: boolean;
+  readonly preferFull?: boolean;
+  readonly tag?: string;
 }
 
 const jsonRpcIdSchema = z.union([z.string().min(1).max(256), z.number().int()]);
@@ -156,5 +165,82 @@ export function parseJsonRpcRequests(
     maxConcurrency,
     ...(options?.cacheTtlMs === undefined ? {} : { cacheTtlMs: options.cacheTtlMs }),
     ...(options?.signal === undefined ? {} : { signal: options.signal }),
+    ...(options?.requireArchive === undefined ? {} : { requireArchive: options.requireArchive }),
+    ...(options?.preferFull === undefined ? {} : { preferFull: options.preferFull }),
+    ...(options?.tag === undefined ? {} : { tag: options.tag }),
   };
+}
+
+/**
+ * Determines whether a block tag or number represents a historical block
+ * that requires an Archive RPC endpoint (as opposed to latest/pending/safe/finalized).
+ */
+export function isHistoricalBlockTag(tag: unknown): boolean {
+  if (tag === undefined || tag === null) {
+    return false;
+  }
+  if (typeof tag === "number" || typeof tag === "bigint") {
+    return true;
+  }
+  if (typeof tag === "string") {
+    const lower = tag.toLowerCase().trim();
+    if (
+      lower === "latest" ||
+      lower === "pending" ||
+      lower === "safe" ||
+      lower === "finalized"
+    ) {
+      return false;
+    }
+    if (lower === "earliest") {
+      return true;
+    }
+    if (/^0x[0-9a-fA-F]+$/.test(lower)) {
+      return true;
+    }
+    if (/^[0-9]+$/.test(lower)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Inspects a standard EVM JSON-RPC request to intelligently determine whether
+ * it requires an Archive RPC node (e.g. historical state reads, historical logs).
+ */
+export function requiresArchiveRequest(request: {
+  readonly method: string;
+  readonly params?: readonly unknown[];
+}): boolean {
+  const method = request.method;
+  const params = request.params ?? [];
+  switch (method) {
+    case "eth_call":
+    case "eth_getBalance":
+    case "eth_getCode":
+    case "eth_getTransactionCount":
+      // params[1] is blockTag (defaulting to "latest" if omitted)
+      return isHistoricalBlockTag(params[1]);
+    case "eth_getStorageAt":
+      // params[2] is blockTag
+      return isHistoricalBlockTag(params[2]);
+    case "eth_getBlockByNumber":
+      // params[0] is blockTag
+      return isHistoricalBlockTag(params[0]);
+    case "eth_getLogs": {
+      const filter = params[0] as
+        | { readonly fromBlock?: unknown; readonly toBlock?: unknown }
+        | undefined;
+      if (filter && typeof filter === "object") {
+        return (
+          isHistoricalBlockTag(filter.fromBlock) ||
+          isHistoricalBlockTag(filter.toBlock)
+        );
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
 }

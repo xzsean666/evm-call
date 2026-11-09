@@ -14,6 +14,7 @@ export interface MulticallAtBlockRequest {
   readonly blockNumber: string | number | bigint;
   readonly calls: readonly MulticallAtBlockCall[];
   readonly signal?: AbortSignal;
+  readonly requireArchive?: boolean;
 }
 
 export interface NormalizedMulticallAtBlockCall {
@@ -28,6 +29,7 @@ export interface NormalizedMulticallAtBlockRequest {
   readonly blockNumber: string;
   readonly calls: readonly NormalizedMulticallAtBlockCall[];
   readonly signal?: AbortSignal;
+  readonly requireArchive?: boolean;
 }
 
 export interface MulticallAtBlockCallResult {
@@ -245,6 +247,7 @@ export function parseMulticallAtBlockRequest(input: unknown): NormalizedMultical
     blockNumber: blockParsed.data,
     calls: Object.freeze(calls),
     ...(candidate.signal instanceof AbortSignal ? { signal: candidate.signal } : {}),
+    ...(candidate.requireArchive !== undefined ? { requireArchive: Boolean(candidate.requireArchive) } : {}),
   };
 }
 

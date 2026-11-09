@@ -56,40 +56,38 @@
      - **SQLite 嵌套事务守护**: `SqliteStorageAdapter` 增加 `inTransaction` 守护，杜绝多层事务嵌套报错。
      - **扩展不可变缓存分类**: `eth_getCode`, `eth_getTransactionCount`, `eth_getBlockByHash` 纳入历史长效缓存。
 
+- [RPC TAGS & INTELLIGENT ROUTING] RPC 节点能力标签与智能分流调度 (全库 163 项测试 100% 通过):
+  1. **端点标签系统 (`tag: "archive" | "full"`)**: 为 `RpcEndpoint` 引入结构化标签，未打 tag 时默认即为 `"archive"`，无论是对象还是纯字符串 URL 均完全无缝向后兼容。
+  2. **探针解耦**: `RpcPool.initialize()` 探活阶段自动识别端点 tag，Archive 节点探测历史块高（如 18M），Full 节点只探 `"latest"`，普通全节点不再被误杀。
+  3. **请求能力自动推导 (`requiresArchiveRequest`)**: 深入解析 EVM JSON-RPC 请求方法及参数（`eth_call`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getLogs`），区分 `"latest"`/`"pending"`/`"safe"`/`"finalized"` 与远古历史块高。
+  4. **智能负载均衡与优雅回退**:
+     - 历史归档查询严格限定在 `archive` 节点中执行；
+     - 常规最新状态查询优先调度 `full` 节点，有效保护珍贵昂贵的 Archive RPC 额度；
+     - 若池中 Full 节点全部因限流进入 CD 惩罚期，最新状态查询优雅平滑回退至 Archive 节点，保障高可用不中断。
+
 ---
 
 ## 2. 修改与创建的文件清单
 ### 修改的文件:
 - [docs/AI/SESSION_STATE.md](file:///ssd0/git/evm-call/docs/AI/SESSION_STATE.md)
-- [docs/AI/DECISIONS.md](file:///ssd0/git/evm-call/docs/AI/DECISIONS.md)
 - `README.md`
-- `src/domain/logModels.ts`
-- `src/storage/SqliteStorageAdapter.ts`
-- `src/storage/RpcCacheService.ts`
-- `src/transport/ArchiveRpcTransport.ts`
+- `src/domain/jsonRpcModels.ts`
+- `src/domain/multicallModels.ts`
 - `src/pool/RpcPool.ts`
+- `src/pool/builtinEthereumRpcs.ts`
 - `src/batch/JsonRpcBatchExecutor.ts`
-- `src/multicall/Erc20Codec.ts`
 - `src/multicall/EthereumArchiveRpcExecutor.ts`
 - `src/client/EvmCallClient.ts`
-- `tests/unit/security-audit-fixes.test.ts`
-- `tests/unit/performance-optimizations.test.ts`
 
 ### 创建的文件:
-- `examples/get-logs-demo.ts`
-- `examples/remote-apis-demo.ts`
-- `tests/unit/get-logs.test.ts`
-- `tests/unit/remote-apis.test.ts`
-- `tests/unit/security-audit-fixes.test.ts`
-- `tests/unit/performance-optimizations.test.ts`
-- `tests/unit/client-features.test.ts`
+- `tests/unit/rpc-tags-routing.test.ts`
 
 ---
 
 ## 3. 已运行的验证命令及结果
 - `pnpm build`: 打包构建成功，生成 `dist/index.js`, `dist/index.cjs`, `dist/index.d.ts` 等分发产物。
-- `pnpm typecheck`: 全库（含源码、测试与全部示例）TypeScript 类型检查 100% 通过。
-- `pnpm test`: 全库 20 个测试套件共 157 个测试用例全部 PASS（耗时 ~1.0s）。
+- `pnpm typecheck`: 全库（含源码、测试与全部示例）TypeScript 类型检查 100% 通过（0 错误）。
+- `pnpm test`: 全库 21 个测试套件共 163 个测试用例全部 PASS（耗时 ~1.0s）。
 
 ---
 

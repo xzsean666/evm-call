@@ -22,15 +22,16 @@ import {
   type BatchNativeBalanceItemResult,
   type NormalizedMulticallAtBlockCall,
 } from "../domain/multicallModels";
-import type {
-  JsonRpcBatchExecutionOptions,
-  JsonRpcBatchItemResult,
-  JsonRpcRequest,
-  BlockTagOrNumber,
-  EstimateGasRequest,
-  EthCallRequest,
-  FeeHistoryResult,
-  TransactionWithReceipt,
+import {
+  type JsonRpcBatchExecutionOptions,
+  type JsonRpcBatchItemResult,
+  type JsonRpcRequest,
+  type BlockTagOrNumber,
+  type EstimateGasRequest,
+  type EthCallRequest,
+  type FeeHistoryResult,
+  type TransactionWithReceipt,
+  isHistoricalBlockTag,
 } from "../domain/jsonRpcModels";
 import {
   type LogFilter,
@@ -53,7 +54,7 @@ import {
   EthereumArchiveRpcExecutor,
 } from "../multicall";
 import { JsonRpcBatchExecutor } from "../batch";
-import { RpcPool } from "../pool";
+import { RpcPool, type RpcEndpoint, type HealthySnapshotFilter } from "../pool";
 import { SqliteStorageAdapter, RpcCacheService, SqliteCooldownStore } from "../storage";
 import { ArchiveRpcTransport } from "../transport";
 import type { RandomSource } from "../execution/clock";
@@ -62,6 +63,7 @@ import type { RpcPoolLike } from "../batch";
 
 export interface EvmCallClientOptions {
   readonly chainId?: number | string;
+  readonly endpoints?: readonly (RpcEndpoint | string)[];
   readonly customRpcUrls?: readonly string[];
   readonly storagePath?: string;
   readonly storageAdapter?: SqliteStorageAdapter;
@@ -81,6 +83,8 @@ export interface EvmCallClientOptions {
   readonly multicall3DeploymentBlock?: string | bigint;
   readonly randomSource?: RandomSource;
   readonly now?: () => number;
+  /** For non-archive calls, whether to prioritize full nodes (defaults to true). */
+  readonly preferFull?: boolean;
 }
 
 const DEFAULT_MAX_CALLS_PER_MULTICALL = 100;
@@ -126,7 +130,10 @@ export class EvmCallClient {
       options.pool ??
       new RpcPool({
         chainId: this.chainId,
-        ...(options.customRpcUrls !== undefined ? { endpoints: options.customRpcUrls } : {}),
+        preferFull: options.preferFull,
+        ...((options.endpoints ?? options.customRpcUrls) !== undefined
+          ? { endpoints: options.endpoints ?? options.customRpcUrls }
+          : {}),
         ...(options.transport !== undefined ? { transport: options.transport } : {}),
         cooldownStore: new SqliteCooldownStore(this.storageAdapter),
         ...(options.now !== undefined ? { clock: { now: options.now } } : {}),
@@ -248,10 +255,14 @@ export class EvmCallClient {
       ),
     );
 
+    const requireArchive =
+      normalized.requireArchive ?? isHistoricalBlockTag(normalized.blockNumber);
+
     const execution = await this.archiveExecutor.executeMulticallBatches({
       blockNumber: normalized.blockNumber,
       multicall3Address: this.multicall3Address,
       batches: encodedBatches,
+      requireArchive,
       ...(normalized.signal !== undefined ? { signal: normalized.signal } : {}),
     });
 
@@ -302,6 +313,7 @@ export class EvmCallClient {
     }
 
     let blockNumber = normalized.blockNumber;
+    const isHistorical = blockNumber !== undefined && isHistoricalBlockTag(blockNumber);
     if (blockNumber === undefined) {
       const latest = await this.archiveExecutor.findLatestBlockNumber(normalized.signal);
       blockNumber = latest.blockNumber;
@@ -310,6 +322,7 @@ export class EvmCallClient {
     const raw = await this.multicall({
       chain: normalized.chainId,
       blockNumber,
+      requireArchive: isHistorical,
       calls: normalized.calls.map((call) => ({
         id: call.id,
         target: call.tokenAddress,
@@ -372,10 +385,11 @@ export class EvmCallClient {
     timestampSeconds: number | bigint | string,
     lowerBoundBlock?: number | bigint | string,
     signal?: AbortSignal,
+    options?: { readonly requireArchive?: boolean; readonly tag?: string },
   ): Promise<{ readonly blockNumber: string; readonly rpcEndpointId: string }> {
     const target = BigInt(timestampSeconds);
     const lower = lowerBoundBlock !== undefined ? BigInt(lowerBoundBlock) : 0n;
-    return this.archiveExecutor.findBlockNumberByTimestamp(target, lower, signal);
+    return this.archiveExecutor.findBlockNumberByTimestamp(target, lower, signal, options);
   }
 
   /**
@@ -383,8 +397,9 @@ export class EvmCallClient {
    */
   async findLatestBlockNumber(
     signal?: AbortSignal,
+    options?: { readonly requireArchive?: boolean; readonly tag?: string },
   ): Promise<{ readonly blockNumber: string; readonly rpcEndpointId: string }> {
-    return this.archiveExecutor.findLatestBlockNumber(signal);
+    return this.archiveExecutor.findLatestBlockNumber(signal, options);
   }
 
   /**
@@ -402,9 +417,11 @@ export class EvmCallClient {
       );
     }
 
+    const isHistorical = isHistoricalBlockTag(normalized.blockNumber);
     const res = await this.archiveExecutor.getNativeBalanceAtBlock({
       address: normalized.address,
       blockNumber: normalized.blockNumber,
+      requireArchive: isHistorical,
       ...(normalized.signal !== undefined ? { signal: normalized.signal } : {}),
     });
 
@@ -433,6 +450,7 @@ export class EvmCallClient {
     }
 
     let blockNumber = normalized.blockNumber;
+    const isHistorical = blockNumber !== undefined && isHistoricalBlockTag(blockNumber);
     if (blockNumber === undefined) {
       const latest = await this.archiveExecutor.findLatestBlockNumber(normalized.signal);
       blockNumber = latest.blockNumber;
@@ -448,6 +466,7 @@ export class EvmCallClient {
     const raw = await this.multicall({
       chain: normalized.chainId,
       blockNumber,
+      requireArchive: isHistorical,
       calls,
       ...(normalized.signal !== undefined ? { signal: normalized.signal } : {}),
     });
@@ -1141,10 +1160,10 @@ export class EvmCallClient {
   }
 
   /**
-   * Gets a list of currently healthy RPC endpoints in the pool.
+   * Gets a list of currently healthy RPC endpoints in the pool, optionally filtered by tag or archive requirement.
    */
-  getHealthyEndpoints(): readonly { id: string; url: string }[] {
-    return this.pool.healthySnapshot(this.randomSource);
+  getHealthyEndpoints(filter?: HealthySnapshotFilter): readonly { id: string; url: string; tag?: string }[] {
+    return this.pool.healthySnapshot(this.randomSource, filter);
   }
 }
 
