@@ -370,43 +370,122 @@ export class EthereumArchiveRpcExecutor {
     readonly batchReturnData: readonly string[];
   }> {
     const blockTag = toBlockTag(request.blockNumber);
+    const remainingMs = Math.max(1, deadline - this.now());
+    const timeoutMs = Math.min(this.attemptTimeoutMs, remainingMs);
 
-    const preHeader = await this.readBlockHeader(endpoint, blockTag, request.signal, deadline);
+    try {
+      // Send pre-header, multicall batches, and post-header in a single JSON-RPC batch (1 RTT)
+      const batchRequests = [
+        {
+          id: "pre_header",
+          method: "eth_getBlockByNumber",
+          params: [blockTag, false],
+        },
+        ...request.batches.map((batch, idx) => ({
+          id: `call_${idx}`,
+          method: "eth_call",
+          params: [{ to: request.multicall3Address, data: batch }, blockTag],
+        })),
+        {
+          id: "post_header",
+          method: "eth_getBlockByNumber",
+          params: [blockTag, false],
+        },
+      ];
 
-    let batchReturnData: string[];
-    if (request.batches.length === 1) {
-      const returnData = await this.callAggregate3(
-        endpoint,
-        request.multicall3Address,
-        request.batches[0]!,
-        blockTag,
-        request.signal,
-        deadline,
-      );
-      batchReturnData = [returnData];
-    } else {
-      const remainingMs = Math.max(1, deadline - this.now());
-      const timeoutMs = Math.min(this.attemptTimeoutMs, remainingMs);
-      const batchRequests = request.batches.map((batch, idx) => ({
-        id: idx,
-        method: "eth_call",
-        params: [{ to: request.multicall3Address, data: batch }, blockTag],
-      }));
       const items = await this.transport.batchCall({
         endpointUrl: endpoint.url,
         requests: batchRequests,
         timeoutMs,
+        ...(endpoint.headers !== undefined ? { headers: endpoint.headers } : {}),
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
-      batchReturnData = items.map((item) => {
-        if (!item.success || typeof item.result !== "string" || !/^0x(?:[0-9a-fA-F]{2})*$/.test(item.result)) {
+
+      const preItem = items.find((it) => String(it.id) === "pre_header");
+      if (preItem === undefined || !preItem.success) {
+        throw rpcBlockNotFound(
+          `RPC endpoint failed to read pre-block header at ${blockTag}: ${preItem?.error?.message ?? "unknown error"}`,
+          { rpcEndpointId: endpoint.id },
+        );
+      }
+      const preHeader = parseBlockHeaderObject(preItem.result, blockTag, endpoint.id);
+
+      const postItem = items.find((it) => String(it.id) === "post_header");
+      if (postItem === undefined || !postItem.success) {
+        throw rpcBlockNotFound(
+          `RPC endpoint failed to read post-block header at ${blockTag}: ${postItem?.error?.message ?? "unknown error"}`,
+          { rpcEndpointId: endpoint.id },
+        );
+      }
+      const postHeader = parseBlockHeaderObject(postItem.result, blockTag, endpoint.id);
+
+      if (preHeader.hash !== postHeader.hash) {
+        throw rpcBlockReorgDetected(
+          "Block hash changed while executing Multicall batches; potential reorg detected.",
+          { rpcEndpointId: endpoint.id },
+        );
+      }
+
+      const batchReturnData: string[] = [];
+      for (let idx = 0; idx < request.batches.length; idx += 1) {
+        const callItem = items.find((it) => String(it.id) === `call_${idx}`);
+        if (
+          callItem === undefined ||
+          !callItem.success ||
+          typeof callItem.result !== "string" ||
+          !/^0x(?:[0-9a-fA-F]{2})*$/.test(callItem.result)
+        ) {
           throw rpcResponseInvalid(
-            `Archive RPC endpoint returned an invalid result for multicall batch item: ${item.error?.message ?? "unknown error"}`,
+            `Archive RPC endpoint returned an invalid result for multicall batch item: ${callItem?.error?.message ?? "unknown error"}`,
             { rpcEndpointId: endpoint.id },
           );
         }
-        return item.result;
-      });
+        batchReturnData.push(callItem.result);
+      }
+
+      return {
+        blockHash: preHeader.hash,
+        blockTimestamp: preHeader.timestamp,
+        rpcEndpointId: endpoint.id,
+        batchReturnData: Object.freeze(batchReturnData),
+      };
+    } catch (error: unknown) {
+      if (isEvmCallError(error) && error.code === "RPC_RESPONSE_INVALID") {
+        return this.executeOnEndpointSeparateCalls(endpoint, request, deadline);
+      }
+      throw error;
+    }
+  }
+
+  private async executeOnEndpointSeparateCalls(
+    endpoint: RpcEndpointLike,
+    request: {
+      readonly blockNumber: string;
+      readonly multicall3Address: string;
+      readonly batches: readonly string[];
+      readonly signal?: AbortSignal;
+    },
+    deadline: number,
+  ): Promise<{
+    readonly blockHash: string;
+    readonly blockTimestamp: string;
+    readonly rpcEndpointId: string;
+    readonly batchReturnData: readonly string[];
+  }> {
+    const blockTag = toBlockTag(request.blockNumber);
+    const preHeader = await this.readBlockHeader(endpoint, blockTag, request.signal, deadline);
+
+    const batchReturnData: string[] = [];
+    for (const batch of request.batches) {
+      const returnData = await this.callAggregate3(
+        endpoint,
+        request.multicall3Address,
+        batch,
+        blockTag,
+        request.signal,
+        deadline,
+      );
+      batchReturnData.push(returnData);
     }
 
     const postHeader = await this.readBlockHeader(endpoint, blockTag, request.signal, deadline);
@@ -426,6 +505,103 @@ export class EthereumArchiveRpcExecutor {
   }
 
   private async getNativeBalanceOnEndpoint(
+    endpoint: RpcEndpointLike,
+    request: {
+      readonly address: string;
+      readonly blockNumber: string;
+      readonly signal?: AbortSignal;
+    },
+    deadline: number,
+  ): Promise<{
+    readonly amount: string;
+    readonly blockHash: string;
+    readonly blockTimestamp: string;
+    readonly rpcEndpointId: string;
+  }> {
+    const blockTag = toBlockTag(request.blockNumber);
+    const remainingMs = Math.max(1, deadline - this.now());
+    const timeoutMs = Math.min(this.attemptTimeoutMs, remainingMs);
+
+    try {
+      // Send pre-header, getBalance, and post-header in a single JSON-RPC batch (1 RTT)
+      const batchRequests = [
+        {
+          id: "pre_header",
+          method: "eth_getBlockByNumber",
+          params: [blockTag, false],
+        },
+        {
+          id: "get_balance",
+          method: "eth_getBalance",
+          params: [request.address, blockTag],
+        },
+        {
+          id: "post_header",
+          method: "eth_getBlockByNumber",
+          params: [blockTag, false],
+        },
+      ];
+
+      const items = await this.transport.batchCall({
+        endpointUrl: endpoint.url,
+        requests: batchRequests,
+        timeoutMs,
+        ...(endpoint.headers !== undefined ? { headers: endpoint.headers } : {}),
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      });
+
+      const preItem = items.find((it) => String(it.id) === "pre_header");
+      if (preItem === undefined || !preItem.success) {
+        throw rpcBlockNotFound(
+          `RPC endpoint failed to read pre-block header at ${blockTag}: ${preItem?.error?.message ?? "unknown error"}`,
+          { rpcEndpointId: endpoint.id },
+        );
+      }
+      const preHeader = parseBlockHeaderObject(preItem.result, blockTag, endpoint.id);
+
+      const postItem = items.find((it) => String(it.id) === "post_header");
+      if (postItem === undefined || !postItem.success) {
+        throw rpcBlockNotFound(
+          `RPC endpoint failed to read post-block header at ${blockTag}: ${postItem?.error?.message ?? "unknown error"}`,
+          { rpcEndpointId: endpoint.id },
+        );
+      }
+      const postHeader = parseBlockHeaderObject(postItem.result, blockTag, endpoint.id);
+
+      if (preHeader.hash !== postHeader.hash) {
+        throw rpcBlockReorgDetected(
+          "Block hash changed while reading native balance; potential reorg detected.",
+          { rpcEndpointId: endpoint.id },
+        );
+      }
+
+      const balItem = items.find((it) => String(it.id) === "get_balance");
+      if (
+        balItem === undefined ||
+        !balItem.success ||
+        typeof balItem.result !== "string" ||
+        !/^0x[0-9a-fA-F]+$/.test(balItem.result)
+      ) {
+        throw rpcResponseInvalid("RPC endpoint returned a malformed native balance.", {
+          rpcEndpointId: endpoint.id,
+        });
+      }
+
+      return {
+        amount: BigInt(balItem.result).toString(10),
+        blockHash: preHeader.hash,
+        blockTimestamp: preHeader.timestamp,
+        rpcEndpointId: endpoint.id,
+      };
+    } catch (error: unknown) {
+      if (isEvmCallError(error) && error.code === "RPC_RESPONSE_INVALID") {
+        return this.getNativeBalanceOnEndpointSeparateCalls(endpoint, request, deadline);
+      }
+      throw error;
+    }
+  }
+
+  private async getNativeBalanceOnEndpointSeparateCalls(
     endpoint: RpcEndpointLike,
     request: {
       readonly address: string;
@@ -473,27 +649,7 @@ export class EthereumArchiveRpcExecutor {
     deadline: number,
   ): Promise<BlockHeader> {
     const result = await this.call(endpoint, "eth_getBlockByNumber", [blockTag, false], signal, deadline);
-    if (result === null) {
-      throw rpcBlockNotFound(`RPC endpoint has no block at ${blockTag}.`);
-    }
-    if (result === undefined || typeof result !== "object") {
-      throw rpcResponseInvalid("RPC endpoint returned a malformed block header.");
-    }
-    const block = result as { hash?: unknown; number?: unknown; timestamp?: unknown };
-    if (typeof block.hash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(block.hash)) {
-      throw rpcResponseInvalid("RPC endpoint returned a malformed block hash.");
-    }
-    if (
-      typeof block.number !== "string" ||
-      !/^0x[0-9a-fA-F]+$/.test(block.number) ||
-      BigInt(block.number) !== BigInt(blockTag)
-    ) {
-      throw rpcResponseInvalid("RPC endpoint returned a block header for the wrong block.");
-    }
-    if (typeof block.timestamp !== "string" || !/^0x[0-9a-fA-F]+$/.test(block.timestamp)) {
-      throw rpcResponseInvalid("RPC endpoint returned a malformed block timestamp.");
-    }
-    return Object.freeze({ hash: block.hash, timestamp: BigInt(block.timestamp).toString(10) });
+    return parseBlockHeaderObject(result, blockTag, endpoint.id);
   }
 
   private async callAggregate3(
@@ -531,6 +687,7 @@ export class EthereumArchiveRpcExecutor {
       method,
       params,
       timeoutMs,
+      ...(endpoint.headers !== undefined ? { headers: endpoint.headers } : {}),
       ...(signal === undefined ? {} : { signal }),
     };
     try {
@@ -545,6 +702,31 @@ export class EthereumArchiveRpcExecutor {
       throw error;
     }
   }
+}
+
+function parseBlockHeaderObject(value: unknown, blockTag: string, endpointId?: string): BlockHeader {
+  const errOpts = endpointId !== undefined ? { rpcEndpointId: endpointId } : undefined;
+  if (value === null) {
+    throw rpcBlockNotFound(`RPC endpoint has no block at ${blockTag}.`, errOpts);
+  }
+  if (value === undefined || typeof value !== "object") {
+    throw rpcResponseInvalid("RPC endpoint returned a malformed block header.", errOpts);
+  }
+  const block = value as { hash?: unknown; number?: unknown; timestamp?: unknown };
+  if (typeof block.hash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(block.hash)) {
+    throw rpcResponseInvalid("RPC endpoint returned a malformed block hash.", errOpts);
+  }
+  if (
+    typeof block.number !== "string" ||
+    !/^0x[0-9a-fA-F]+$/.test(block.number) ||
+    BigInt(block.number) !== BigInt(blockTag)
+  ) {
+    throw rpcResponseInvalid("RPC endpoint returned a block header for the wrong block.", errOpts);
+  }
+  if (typeof block.timestamp !== "string" || !/^0x[0-9a-fA-F]+$/.test(block.timestamp)) {
+    throw rpcResponseInvalid("RPC endpoint returned a malformed block timestamp.", errOpts);
+  }
+  return Object.freeze({ hash: block.hash, timestamp: BigInt(block.timestamp).toString(10) });
 }
 
 function isRetryableFailure(error: unknown): boolean {

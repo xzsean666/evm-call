@@ -104,6 +104,12 @@ export class SqliteStorageAdapter {
       if (this.statementCache.size >= 128) {
         const firstKey = this.statementCache.keys().next().value;
         if (firstKey !== undefined) {
+          const oldStmt = this.statementCache.get(firstKey);
+          try {
+            oldStmt?.close?.();
+          } catch {
+            // ignore statement close errors
+          }
           this.statementCache.delete(firstKey);
         }
       }
@@ -172,6 +178,13 @@ export class SqliteStorageAdapter {
 
   close(): void {
     if (this.db !== null) {
+      for (const stmt of this.statementCache.values()) {
+        try {
+          stmt?.close?.();
+        } catch {
+          // ignore
+        }
+      }
       this.statementCache.clear();
       this.db.close();
       this.db = null;

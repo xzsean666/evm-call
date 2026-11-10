@@ -35,6 +35,7 @@ export interface RpcEndpoint {
   readonly url: string;
   readonly envKeyName?: string;
   readonly tag?: RpcEndpointTag | string;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 export interface EndpointCooldownState {
@@ -127,6 +128,7 @@ export class RpcPool {
   private readonly defaultFallbackToEarliestExpiring: boolean;
   private readonly healthy = new Map<string, boolean>();
   private readonly trackers = new Map<string, CooldownTracker>();
+  private readonly invalidChainEndpoints = new Set<string>();
   private readonly onCooldownChange?: ((event: CooldownChangeEvent) => void) | undefined;
   private lastHealthRefreshAt = 0;
   private healthRefreshPromise: Promise<void> | undefined;
@@ -283,7 +285,7 @@ export class RpcPool {
     const allowFallback =
       filter?.fallbackToEarliestExpiring ?? this.defaultFallbackToEarliestExpiring;
     if (candidates.length === 0 && allowFallback) {
-      let poolCandidates = this.endpoints;
+      let poolCandidates = this.endpoints.filter((ep) => !this.invalidChainEndpoints.has(ep.id));
       if (filter?.tag !== undefined) {
         poolCandidates = poolCandidates.filter((ep) => (ep.tag ?? "archive") === filter.tag);
       } else if (filter?.requireArchive) {
@@ -449,6 +451,7 @@ export class RpcPool {
       }
       try {
         if (BigInt(chainIdHex) !== BigInt(this.chainId)) {
+          this.invalidChainEndpoints.add(endpoint.id);
           return false;
         }
       } catch {
@@ -486,6 +489,7 @@ export class RpcPool {
       method,
       params,
       timeoutMs: this.healthCheckTimeoutMs,
+      ...(endpoint.headers !== undefined ? { headers: endpoint.headers } : {}),
       ...(signal === undefined ? {} : { signal }),
     };
     return this.transport.call(options);

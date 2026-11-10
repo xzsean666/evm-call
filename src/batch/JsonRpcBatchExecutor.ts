@@ -25,6 +25,7 @@ export interface RpcEndpointLike {
   readonly id: string;
   readonly url: string;
   readonly tag?: string;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 export interface RpcPoolLike {
@@ -267,6 +268,7 @@ export class JsonRpcBatchExecutor {
           endpointUrl: endpoint.url,
           requests,
           timeoutMs,
+          ...(endpoint.headers !== undefined ? { headers: endpoint.headers } : {}),
           ...(signal !== undefined ? { signal } : {}),
         });
 
@@ -366,6 +368,7 @@ function isAllNodeFailures(results: readonly JsonRpcBatchResponseItem[]): boolea
   return results.every((item) => {
     if (item.success) return false;
     const msg = item.error?.message?.toLowerCase() ?? "";
+    const code = item.error?.code ?? 0;
     // Query parameter limitations and smart contract reverts are NOT node health failures
     if (
       msg.includes("more than") ||
@@ -375,16 +378,33 @@ function isAllNodeFailures(results: readonly JsonRpcBatchResponseItem[]): boolea
     ) {
       return false;
     }
+    // Explicit server error codes or rate limits
+    if (
+      code === -32603 ||
+      (code <= -32000 && code >= -32099) ||
+      code === 429 ||
+      code === -32601
+    ) {
+      return true;
+    }
+    // Node-level failure phrases
     if (
       msg.includes("omitted response") ||
       msg.includes("daily request count") ||
       msg.includes("quota exceeded") ||
       msg.includes("credits exhausted") ||
-      msg.includes("rate limit exceeded") ||
-      msg.includes("compute units")
+      msg.includes("rate limit") ||
+      msg.includes("compute units") ||
+      msg.includes("internal error") ||
+      msg.includes("server error") ||
+      msg.includes("busy") ||
+      msg.includes("unavailable") ||
+      msg.includes("connection") ||
+      msg.includes("header not found")
     ) {
       return true;
     }
-    return false;
+    // If all items failed without a revert or query size limitation, treat as node outage
+    return true;
   });
 }

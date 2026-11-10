@@ -9,11 +9,14 @@ export interface RpcCacheOptions {
   readonly historicalTtlMs?: number;
   /** Maximum number of entries in the in-memory L1 hot cache. Defaults to 500 (set to 0 to disable). */
   readonly maxMemoryEntries?: number;
+  /** Minimum block confirmations required before a block is considered immutable historical. Defaults to 64. */
+  readonly finalityThresholdBlocks?: number;
 }
 
 export const DEFAULT_VOLATILE_TTL_MS = 10_000; // 10s
 export const DEFAULT_HISTORICAL_TTL_MS = 30 * 86_400_000; // 30 days
 export const DEFAULT_MAX_MEMORY_ENTRIES = 500;
+export const DEFAULT_FINALITY_THRESHOLD_BLOCKS = 64;
 
 export interface CacheEntryMetadata {
   readonly isHistorical: boolean;
@@ -33,6 +36,7 @@ export class RpcCacheService {
   private readonly volatileTtlMs: number;
   private readonly historicalTtlMs: number;
   private readonly maxMemoryEntries: number;
+  private readonly finalityThresholdBlocks: number;
   private readonly memoryCache = new Map<string, { value: unknown; expiresAt: number }>();
 
   constructor(storage: SqliteStorageAdapter, options: RpcCacheOptions = {}) {
@@ -40,6 +44,7 @@ export class RpcCacheService {
     this.volatileTtlMs = options.volatileTtlMs ?? DEFAULT_VOLATILE_TTL_MS;
     this.historicalTtlMs = options.historicalTtlMs ?? DEFAULT_HISTORICAL_TTL_MS;
     this.maxMemoryEntries = Math.max(0, options.maxMemoryEntries ?? DEFAULT_MAX_MEMORY_ENTRIES);
+    this.finalityThresholdBlocks = Math.max(0, options.finalityThresholdBlocks ?? DEFAULT_FINALITY_THRESHOLD_BLOCKS);
   }
 
   /**
@@ -55,7 +60,11 @@ export class RpcCacheService {
   /**
    * Evaluates whether a call targets an immutable historical block.
    */
-  classifyRequest(method: string, params: unknown): CacheEntryMetadata {
+  classifyRequest(
+    method: string,
+    params: unknown,
+    options?: { latestBlockNumber?: bigint },
+  ): CacheEntryMetadata {
     const normalizedMethod = method.trim().toLowerCase();
     let blockTag: string | null = null;
 
@@ -73,7 +82,7 @@ export class RpcCacheService {
         if (typeof params[2] === "string" || typeof params[2] === "number" || typeof params[2] === "bigint") {
           blockTag = String(params[2]);
         }
-      } else if (normalizedMethod === "eth_getblockbynumber") {
+      } else if (normalizedMethod === "eth_getblockbynumber" || normalizedMethod === "eth_getblockreceipts") {
         if (typeof params[0] === "string" || typeof params[0] === "number" || typeof params[0] === "bigint") {
           blockTag = String(params[0]);
         }
@@ -104,6 +113,16 @@ export class RpcCacheService {
       }
       // Exact hex block (0x...) or decimal integer
       if (/^0x[0-9a-f]+$/i.test(tagLower) || /^[0-9]+$/.test(tagLower)) {
+        if (options?.latestBlockNumber !== undefined) {
+          try {
+            const blockNum = BigInt(tagLower);
+            if (blockNum > options.latestBlockNumber - BigInt(this.finalityThresholdBlocks)) {
+              return { isHistorical: false, blockTag: tagLower };
+            }
+          } catch {
+            // fallback
+          }
+        }
         return { isHistorical: true, blockTag: tagLower };
       }
     }
@@ -128,6 +147,9 @@ export class RpcCacheService {
     const mem = this.memoryCache.get(key);
     if (mem !== undefined) {
       if (mem.expiresAt > now) {
+        // Refresh position for true LRU
+        this.memoryCache.delete(key);
+        this.memoryCache.set(key, mem);
         return mem.value as T;
       }
       this.memoryCache.delete(key);
@@ -163,14 +185,41 @@ export class RpcCacheService {
     method: string,
     params: unknown,
     result: unknown,
-    options?: { cacheTtlMs?: number; now?: number },
+    options?: { cacheTtlMs?: number; now?: number; latestBlockNumber?: bigint },
   ): void {
     if (options?.cacheTtlMs === 0) {
       // 0 explicitly means bypass / don't cache
       return;
     }
 
-    const { isHistorical, blockTag } = this.classifyRequest(method, params);
+    const normalizedMethod = method.trim().toLowerCase();
+    // Do not cache null transactions or receipts (e.g. pending transactions)
+    if (
+      result === null &&
+      (normalizedMethod === "eth_gettransactionreceipt" ||
+        normalizedMethod === "eth_gettransactionbyhash")
+    ) {
+      return;
+    }
+
+    let { isHistorical, blockTag } = this.classifyRequest(method, params, {
+      ...(options?.latestBlockNumber !== undefined ? { latestBlockNumber: options.latestBlockNumber } : {}),
+    });
+
+    // If transaction or receipt has a confirmed blockNumber, mark as historical
+    if (
+      !isHistorical &&
+      result !== null &&
+      typeof result === "object" &&
+      (normalizedMethod === "eth_gettransactionreceipt" ||
+        normalizedMethod === "eth_gettransactionbyhash")
+    ) {
+      const candidate = result as { blockNumber?: unknown };
+      if (candidate.blockNumber !== null && candidate.blockNumber !== undefined) {
+        isHistorical = true;
+      }
+    }
+
     const now = options?.now ?? Date.now();
     const ttlMs =
       options?.cacheTtlMs ??
@@ -297,7 +346,9 @@ export class RpcCacheService {
     if (this.maxMemoryEntries <= 0) {
       return;
     }
-    if (this.memoryCache.size >= this.maxMemoryEntries) {
+    if (this.memoryCache.has(key)) {
+      this.memoryCache.delete(key);
+    } else if (this.memoryCache.size >= this.maxMemoryEntries) {
       const firstKey = this.memoryCache.keys().next().value;
       if (firstKey !== undefined) {
         this.memoryCache.delete(firstKey);

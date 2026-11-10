@@ -20,6 +20,7 @@ export interface ArchiveRpcCallOptions {
   readonly params: readonly unknown[];
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 export interface ArchiveRpcBatchCallOptions {
@@ -32,6 +33,7 @@ export interface ArchiveRpcBatchCallOptions {
   }[];
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 export interface JsonRpcBatchResponseItem {
@@ -104,7 +106,10 @@ export class ArchiveRpcTransport {
       response = await this.httpTransport.request({
         method: "POST",
         url: options.endpointUrl,
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(options.headers !== undefined ? options.headers : {}),
+        },
         body: {
           jsonrpc: "2.0",
           id: 1,
@@ -162,7 +167,10 @@ export class ArchiveRpcTransport {
       response = await this.httpTransport.request({
         method: "POST",
         url: options.endpointUrl,
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(options.headers !== undefined ? options.headers : {}),
+        },
         body,
         timeoutMs: options.timeoutMs,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -186,20 +194,51 @@ export class ArchiveRpcTransport {
       throw rpcResponseInvalid("Archive RPC endpoint returned an unexpected non-array batch response.");
     }
 
-    const parsed = z.array(jsonRpcEnvelopeSchema).safeParse(response.body);
-    if (!parsed.success) {
+    if (!Array.isArray(response.body)) {
       throw rpcResponseInvalid("Archive RPC endpoint returned a malformed JSON-RPC batch response.");
     }
 
-    const responseById = new Map<string | number, z.infer<typeof jsonRpcEnvelopeSchema>>();
-    for (const item of parsed.data) {
-      if (item.id !== undefined && item.id !== null) {
-        responseById.set(item.id, item);
-        responseById.set(String(item.id), item);
-        if (typeof item.id === "string" && /^\d+$/.test(item.id)) {
-          const num = Number(item.id);
-          if (Number.isSafeInteger(num)) {
-            responseById.set(num, item);
+    const responseById = new Map<
+      string | number,
+      { result?: unknown; error?: { code: number; message: string; data?: unknown } }
+    >();
+
+    for (const item of response.body) {
+      if (item !== null && typeof item === "object") {
+        const candidate = item as {
+          id?: unknown;
+          result?: unknown;
+          error?: { code?: unknown; message?: unknown; data?: unknown };
+        };
+        const id = candidate.id;
+        if (id !== undefined && id !== null) {
+          const validError =
+            candidate.error !== undefined &&
+            typeof candidate.error === "object" &&
+            candidate.error !== null &&
+            typeof candidate.error.code === "number" &&
+            typeof candidate.error.message === "string"
+              ? {
+                  code: Math.trunc(candidate.error.code),
+                  message: candidate.error.message,
+                  ...(candidate.error.data !== undefined ? { data: candidate.error.data } : {}),
+                }
+              : undefined;
+
+          const entry: { result?: unknown; error?: { code: number; message: string; data?: unknown } } = {
+            result: candidate.result,
+            ...(validError !== undefined ? { error: validError } : {}),
+          };
+
+          if (typeof id === "string" || typeof id === "number") {
+            responseById.set(id, entry);
+            responseById.set(String(id), entry);
+            if (typeof id === "string" && /^\d+$/.test(id)) {
+              const num = Number(id);
+              if (Number.isSafeInteger(num)) {
+                responseById.set(num, entry);
+              }
+            }
           }
         }
       }
@@ -279,11 +318,12 @@ function validateEndpointUrl(endpointUrl: string, allowInsecureHttp: boolean): v
     throw archiveRpcUnavailable("Archive RPC endpoint URL is invalid.");
   }
 
+  const hostname = parsedUrl.hostname.replace(/^\[|\]$/g, "");
   const isLocalhost =
-    parsedUrl.hostname === "localhost" ||
-    parsedUrl.hostname === "127.0.0.1" ||
-    parsedUrl.hostname === "::1" ||
-    parsedUrl.hostname === "0.0.0.0";
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname === "0.0.0.0";
 
   if (parsedUrl.protocol !== "https:" && !(allowInsecureHttp || isLocalhost)) {
     throw archiveRpcUnavailable("Archive RPC endpoints must use HTTPS.");

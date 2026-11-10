@@ -15,6 +15,18 @@ class MockHttpTransport implements HttpTransport {
   }
 
   async request(req: { url: string; body?: unknown }): Promise<HttpResponse> {
+    if (Array.isArray(req.body)) {
+      const items: unknown[] = [];
+      for (const item of req.body) {
+        const res = await this.handler(req.url, item);
+        items.push(res.body);
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: items,
+      };
+    }
     const res = await this.handler(req.url, req.body);
     return {
       status: res.status,

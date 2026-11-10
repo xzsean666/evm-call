@@ -1181,7 +1181,9 @@ function chunk<T>(values: readonly T[], size: number): readonly (readonly T[])[]
 
 function formatBlockTag(tag: string | number | bigint): string {
   if (typeof tag === "bigint" || typeof tag === "number") {
-    return `0x${BigInt(tag).toString(16)}`;
+    const big = BigInt(tag);
+    if (big < 0n) throw invalidRequest("Block number cannot be negative.");
+    return `0x${big.toString(16)}`;
   }
   const trimmed = tag.trim().toLowerCase();
   if (
@@ -1196,33 +1198,40 @@ function formatBlockTag(tag: string | number | bigint): string {
   if (trimmed.startsWith("0x")) {
     return trimmed;
   }
-  return `0x${BigInt(trimmed).toString(16)}`;
+  const big = BigInt(trimmed);
+  if (big < 0n) throw invalidRequest("Block number cannot be negative.");
+  return `0x${big.toString(16)}`;
 }
 
 function toBlockNumberBigInt(tag: string | number | bigint): bigint {
-  if (typeof tag === "bigint") return tag;
-  if (typeof tag === "number") return BigInt(Math.trunc(tag));
-  const str = tag.trim();
-  if (str.startsWith("0x") || str.startsWith("0X")) {
-    return BigInt(str);
+  let big: bigint;
+  if (typeof tag === "bigint") big = tag;
+  else if (typeof tag === "number") big = BigInt(Math.trunc(tag));
+  else {
+    const str = tag.trim();
+    big = BigInt(str);
   }
-  return BigInt(str);
+  if (big < 0n) throw invalidRequest("Block number cannot be negative.");
+  return big;
 }
 
 function isLogRangeOrCountError(error: unknown): boolean {
+  if (error instanceof Error && (error.name === "HttpTransportError" || error.name === "AbortError")) {
+    return false;
+  }
   const msg = error instanceof Error ? error.message.toLowerCase() : "";
   return (
     msg.includes("more than") ||
     msg.includes("too large") ||
     msg.includes("exceed") ||
-    msg.includes("limit") ||
     msg.includes("query returned") ||
     msg.includes("10000") ||
     msg.includes("response size") ||
     msg.includes("max block range") ||
-    msg.includes("timeout") ||
-    msg.includes("-32005") ||
-    msg.includes("-32000")
+    msg.includes("block range limit") ||
+    msg.includes("limit exceeded") ||
+    msg.includes("query timeout") ||
+    msg.includes("execution timeout")
   );
 }
 
